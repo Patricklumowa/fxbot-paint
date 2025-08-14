@@ -2,7 +2,7 @@
   'use strict';
 
   // ===== Config (API-FREE) =====
-  const VERSION = 'v7.3';
+  const VERSION = 'v7.2';
   const UI_TICK_MS = 500;                 // UI refresh tick
   const REOPEN_DELAY_MS = 2000;           // normal reopen delay (non-depletion commits)
   const FULL_DEPLETION_REOPEN_MS = 35000; // wait ~+1 cooldown before reopening palette after "tinta acabou"
@@ -176,6 +176,8 @@
     queue:[], queuePtr:0, painted:0, totalTarget:0,
     palette:[], colorCache:new Map(),
     overlayCanvas:null, overlayNeedsRepaint:true,
+    // overlay anchors (for one-time placement)
+    overlayAnchor:null, overlayAnchorPos:null,
     // speed
     turbo:true, cps:80, colorSettleMs:0,
     // session/autosave
@@ -659,64 +661,73 @@
 
   // ===== Position =====
   function selectPosition() {
-  const rect = canvasRect();
-  if (!rect) {
-    setStatus(t('canvasNotFound'));
-    return;
-  }
-
-  setStatus(t('clickToSetPos'));
-
-  const uiRoot = state.uiRoot || document.getElementById('fx-ui');
-
-  let cancelKeyHandler = null;
-
-  const onClick = (e) => {
-    if (uiRoot && uiRoot.contains(e.target)) {
-      arm();
+    const rect = canvasRect();
+    if (!rect) {
+      setStatus(t('noCanvas'));
       return;
     }
 
-    const tile = Math.max(1, state.pixelSize | 0);
-    const relX = e.clientX - rect.left;
-    const relY = e.clientY - rect.top;
-    const gridX = Math.floor(relX / tile);
-    const gridY = Math.floor(relY / tile);
-    const imgW = Math.max(0, state.imgWidth  || 0);
-    const imgH = Math.max(0, state.imgHeight || 0);
-    const posX = gridX - Math.floor(imgW / 2);
-    const posY = gridY - Math.floor(imgH / 2);
+    setStatus(t('waitingClick'));
 
-    state.pos = { x: posX, y: posY };
+    // make sure clicks inside our UI are ignored
+    const uiRoot = document.getElementById('fxbot-ui');
 
-    markOverlayDirty();
-    ensureOverlay();
-    repaintOverlay();
-    placeOverlay();
-    saveSession('auto');
-    setStatus(t('posSet', { x: state.pos.x, y: state.pos.y }));
+    let cancelKeyHandler = null;
 
-    if (cancelKeyHandler) {
-      document.removeEventListener('keydown', cancelKeyHandler, true);
-      cancelKeyHandler = null;
-    }
-  };
+    const onClick = (e) => {
+      // ignore clicks inside the UI
+      if (uiRoot && uiRoot.contains(e.target)) {
+        arm();
+        return;
+      }
 
-  function arm() {
-    document.addEventListener('click', onClick, { once: true, capture: true });
-    cancelKeyHandler = (ev) => {
-      if (ev.key === 'Escape') {
-        document.removeEventListener('click', onClick, true);
+      const tile = Math.max(1, state.pixelSize | 0);
+      const relX = e.clientX - rect.left;
+      const relY = e.clientY - rect.top;
+
+      // grid (tile) coordinates where user clicked
+      const gridX = Math.floor(relX / tile);
+      const gridY = Math.floor(relY / tile);
+
+      // center the image on that clicked tile (tile coords)
+      const imgW = Math.max(0, state.imgWidth || 0);
+      const imgH = Math.max(0, state.imgHeight || 0);
+      const posTileX = gridX - Math.floor(imgW / 2);
+      const posTileY = gridY - Math.floor(imgH / 2);
+
+      // store state.pos in PIXELS (so overlay and imageToCanvas use the same units)
+      state.pos = { x: posTileX * tile, y: posTileY * tile };
+
+      markOverlayDirty();
+      ensureOverlay();
+      repaintOverlay();
+      placeOverlay();
+      saveSession('auto');
+
+      setStatus(t('posOK', { x: state.pos.x, y: state.pos.y }));
+      showToast(t('posOK', { x: state.pos.x, y: state.pos.y }), 'info', 1200);
+
+      if (cancelKeyHandler) {
         document.removeEventListener('keydown', cancelKeyHandler, true);
         cancelKeyHandler = null;
-        setStatus(t('posSelectCanceled'));
       }
     };
-    document.addEventListener('keydown', cancelKeyHandler, true);
-  }
-  setTimeout(arm, 0);
-}
 
+    function arm() {
+      document.addEventListener('click', onClick, { once: true, capture: true });
+      cancelKeyHandler = (ev) => {
+        if (ev.key === 'Escape') {
+          document.removeEventListener('click', onClick, true);
+          document.removeEventListener('keydown', cancelKeyHandler, true);
+          cancelKeyHandler = null;
+          setStatus(t('needImgPos'));
+          showToast('Position selection cancelled', 'info', 1200);
+        }
+      };
+      document.addEventListener('keydown', cancelKeyHandler, true);
+    }
+    setTimeout(arm, 0);
+  }
 
   function centerPosOnCanvas(){
     const rect=canvasRect(); if(!rect || !state.imgData) return false;
@@ -896,9 +907,11 @@
   function imageToCanvas(ix,iy){
     const rect=canvasRect(); if(!rect||!state.pos) return null;
     const s=Math.max(1,state.pixelSize|0);
-    const x=state.pos.x + ix*s + Math.floor(s/2);
-    const y=state.pos.y + iy*s + Math.floor(s/2);
-    if(x<0||y<0||x>rect.width||y>rect.height) return null;
+    // compute the pixel coordinate inside the canvas viewport
+    const x = state.pos.x + ix*s + Math.floor(s/2);
+    const y = state.pos.y + iy*s + Math.floor(s/2);
+    // bounds check: use >= to avoid off-by-one allowing clicks outside the visible area
+    if(x<0 || y<0 || x>=rect.width || y>=rect.height) return null;
     return {x,y};
   }
 
@@ -1248,7 +1261,7 @@
     // overlay: remova SEMPRE e solte listeners
     try{ window.removeEventListener('scroll', placeOverlay, {passive:true}); }catch{}
     try{ window.removeEventListener('resize', placeOverlay); }catch{}
-    if(state.overlayCanvas){ try{ state.overlayCanvas.remove(); }catch{} state.overlayCanvas=null; }
+    if(state.overlayCanvas){ try{ state.overlayCanvas.remove(); }catch{} state.overlayCanvas=null; state.overlayAnchor=null; state.overlayAnchorPos=null; }
 
     // hotkeys
     if(state.ui.keydownHandler){ window.removeEventListener('keydown', state.ui.keydownHandler, true); state.ui.keydownHandler=null; }
@@ -1329,6 +1342,8 @@
         #fxbot-ui{width:94vw; bottom:10px; right:10px}
         #fxbot-ui .grid3{grid-template-columns:1fr 1fr}
       }
+      /* make overlay crisp when pixelated */
+      #fx-overlay { image-rendering: pixelated; image-rendering: crisp-edges; }
     `;
     document.head.appendChild(s);
   }
