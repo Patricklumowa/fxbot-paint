@@ -176,8 +176,6 @@
     queue:[], queuePtr:0, painted:0, totalTarget:0,
     palette:[], colorCache:new Map(),
     overlayCanvas:null, overlayNeedsRepaint:true,
-    // overlay anchors (for one-time placement)
-    overlayAnchor:null, overlayAnchorPos:null,
     // speed
     turbo:true, cps:80, colorSettleMs:0,
     // session/autosave
@@ -669,13 +667,12 @@
 
     setStatus(t('waitingClick'));
 
-    // make sure clicks inside our UI are ignored
+    // ignore clicks in the UI
     const uiRoot = document.getElementById('fxbot-ui');
 
     let cancelKeyHandler = null;
 
     const onClick = (e) => {
-      // ignore clicks inside the UI
       if (uiRoot && uiRoot.contains(e.target)) {
         arm();
         return;
@@ -684,26 +681,21 @@
       const tile = Math.max(1, state.pixelSize | 0);
       const relX = e.clientX - rect.left;
       const relY = e.clientY - rect.top;
-
-      // grid (tile) coordinates where user clicked
       const gridX = Math.floor(relX / tile);
       const gridY = Math.floor(relY / tile);
-
-      // center the image on that clicked tile (tile coords)
-      const imgW = Math.max(0, state.imgWidth || 0);
+      const imgW = Math.max(0, state.imgWidth  || 0);
       const imgH = Math.max(0, state.imgHeight || 0);
-      const posTileX = gridX - Math.floor(imgW / 2);
-      const posTileY = gridY - Math.floor(imgH / 2);
+      const posX = gridX - Math.floor(imgW / 2);
+      const posY = gridY - Math.floor(imgH / 2);
 
-      // store state.pos in PIXELS (so overlay and imageToCanvas use the same units)
-      state.pos = { x: posTileX * tile, y: posTileY * tile };
+      // STORE position in PIXELS so overlay placement and imageToCanvas use same units
+      state.pos = { x: posX * tile, y: posY * tile };
 
       markOverlayDirty();
       ensureOverlay();
       repaintOverlay();
       placeOverlay();
       saveSession('auto');
-
       setStatus(t('posOK', { x: state.pos.x, y: state.pos.y }));
       showToast(t('posOK', { x: state.pos.x, y: state.pos.y }), 'info', 1200);
 
@@ -721,7 +713,6 @@
           document.removeEventListener('keydown', cancelKeyHandler, true);
           cancelKeyHandler = null;
           setStatus(t('needImgPos'));
-          showToast('Position selection cancelled', 'info', 1200);
         }
       };
       document.addEventListener('keydown', cancelKeyHandler, true);
@@ -736,32 +727,28 @@
     const h = state.imgHeight * tile;
     const x = Math.floor((rect.width  - w)/2);
     const y = Math.floor((rect.height - h)/2);
+    // centerPosOnCanvas stores pixels (consistent with selectPosition)
     state.pos = {x: Math.max(0,x), y: Math.max(0,y)};
     return true;
   }
 
   // ===== Overlay =====
-  // Replaced overlay system to:
-  // - anchor overlay exactly where user sets state.pos (in *pixels*)
-  // - do NOT follow canvas on scroll/resize
-  // - render preview at 1:1 pixel scale (internal buffer == CSS size), imageRendering:'pixelated'
+  // New behaviour:
+  // - state.pos is in PIXELS (so we compute overlay left/top = rect.left + state.pos.x)
+  // - overlay is anchored once and DOES NOT follow scroll/resize; it stays until user sets new pos or toggles overlay
+  // - preview is drawn at 1:1 pixel scale: canvas internal size == css size (cw x ch); image-rendering: pixelated
 
-  // ensureOverlay: creates overlay canvas (fixed) but DOES NOT attach scroll/resize listeners.
-  // Overlay will be positioned once when user sets position and will not move unless user sets a new position.
   function ensureOverlay(){
     if(state.overlayCanvas && document.body.contains(state.overlayCanvas)) return state.overlayCanvas;
     const c=document.createElement('canvas'); c.id='fx-overlay';
-    // fixed so it sits above viewport; we will compute left/top in placeOverlay
     Object.assign(c.style,{position:'fixed',pointerEvents:'none',opacity:'0.65',zIndex:999998, imageRendering:'pixelated'});
     document.body.appendChild(c); state.overlayCanvas=c;
     // Force repaint next refresh to avoid "blank" overlay after toggling
     state.overlayNeedsRepaint = true;
-    // We intentionally DO NOT follow canvas scroll/resize automatically — overlay should stay where user placed it.
-    // If user sets a new state.pos, placeOverlay() will recompute the anchor and move the overlay.
+    // IMPORTANT: do NOT attach scroll/resize listeners; overlay should NOT move after placement
     return c;
   }
 
-  // toggleOverlay remains mostly the same; it will remove the overlay and clear the stored anchor when turned off.
   function toggleOverlay() {
     if (state.overlayCanvas) {
       try {
@@ -770,9 +757,8 @@
         console.error(e);
       }
       state.overlayCanvas = null;
-      // clear anchor so next enable repositions fresh
-      state.overlayAnchor = null;
-      state.overlayAnchorPos = null;
+      // clear stored anchor
+      state._overlayAnchor = null;
       setStatus(t('overlayOff'));
       return;
     }
@@ -791,16 +777,16 @@
     setStatus(t('overlayOn'));
   }
 
-  // repaintOverlay: draw the preview at 1:1 pixel scale according to state.pixelSize.
-  // This sets both the canvas internal resolution and its CSS size so the preview does not get
-  // auto-scaled by page zoom/transform (it will remain fixed at the computed pixels).
+  function markOverlayDirty(){ state.overlayNeedsRepaint=true; }
+  function refreshOverlay(){ if(!state.overlayCanvas) return; repaintOverlay(); placeOverlay(); }
+
   function repaintOverlay(){
     if(!state.overlayCanvas||!state.imgData) return;
-    const tile = Math.max(1, state.pixelSize|0); // tile size in CSS pixels
+    const tile=Math.max(1,state.pixelSize|0);
     const iw=state.imgWidth, ih=state.imgHeight;
     const cw=iw*tile, ch=ih*tile;
 
-    // Set internal pixel buffer and CSS size to the exact same values -> 1:1 mapping
+    // set internal buffer and CSS size equal -> 1:1 pixel mapping
     if(state.overlayCanvas.width !== cw) state.overlayCanvas.width = cw;
     if(state.overlayCanvas.height !== ch) state.overlayCanvas.height = ch;
     state.overlayCanvas.style.width = cw + 'px';
@@ -809,7 +795,6 @@
     if(!state.overlayNeedsRepaint) return;
     state.overlayNeedsRepaint=false;
     const ctx=state.overlayCanvas.getContext('2d');
-    // disable smoothing to keep crisp pixel-art look
     ctx.imageSmoothingEnabled = false;
     ctx.clearRect(0,0,cw,ch);
     const pal=state.palette.length?state.palette:extractPalette(); const usePal=pal.length>0; const cache=new Map();
@@ -831,27 +816,25 @@
     }
   }
 
-  // placeOverlay: compute a fixed viewport anchor only when state.pos changes.
-  // After anchor is set, the overlay will stay there until the user moves the image (sets a new pos).
   function placeOverlay(){
     if(!state.overlayCanvas||!state.pos) return;
 
-    // If we already anchored to this exact state.pos, keep it — do not recompute.
-    if(state.overlayAnchor && state.overlayAnchorPos && state.overlayAnchorPos.x === state.pos.x && state.overlayAnchorPos.y === state.pos.y){
-      // just ensure CSS left/top remain applied
-      state.overlayCanvas.style.left = state.overlayAnchor.left + 'px';
-      state.overlayCanvas.style.top  = state.overlayAnchor.top  + 'px';
+    // If overlay already anchored to the same state.pos, keep it
+    if(state._overlayAnchor && state._overlayAnchorPos &&
+       state._overlayAnchorPos.x === state.pos.x && state._overlayAnchorPos.y === state.pos.y) {
+      // re-apply stored left/top to ensure still in DOM
+      state.overlayCanvas.style.left = state._overlayAnchor.left + 'px';
+      state.overlayCanvas.style.top  = state._overlayAnchor.top  + 'px';
       return;
     }
 
-    // Compute a new anchor based on the *current* canvas viewport coordinates and the user-set state.pos.
     const rect = canvasRect(); if(!rect) return;
-    // canvasRect() is viewport-relative; overlay is fixed -> use rect.left/top directly (no scroll offsets)
+    // canvasRect() returns viewport coords; overlay is fixed (viewport-relative), so use rect.left/top directly.
     const left = rect.left + state.pos.x;
     const top  = rect.top  + state.pos.y;
 
-    state.overlayAnchor = { left, top };
-    state.overlayAnchorPos = { x: state.pos.x, y: state.pos.y };
+    state._overlayAnchor = { left, top };
+    state._overlayAnchorPos = { x: state.pos.x, y: state.pos.y };
 
     state.overlayCanvas.style.left = left + 'px';
     state.overlayCanvas.style.top  = top  + 'px';
@@ -907,11 +890,10 @@
   function imageToCanvas(ix,iy){
     const rect=canvasRect(); if(!rect||!state.pos) return null;
     const s=Math.max(1,state.pixelSize|0);
-    // compute the pixel coordinate inside the canvas viewport
-    const x = state.pos.x + ix*s + Math.floor(s/2);
-    const y = state.pos.y + iy*s + Math.floor(s/2);
-    // bounds check: use >= to avoid off-by-one allowing clicks outside the visible area
-    if(x<0 || y<0 || x>=rect.width || y>=rect.height) return null;
+    const x=state.pos.x + ix*s + Math.floor(s/2);
+    const y=state.pos.y + iy*s + Math.floor(s/2);
+    // bounds: use >= to avoid off-by-one; rect.width/height are viewport sizes
+    if(x<0||y<0||x>=rect.width||y>=rect.height) return null;
     return {x,y};
   }
 
@@ -1261,7 +1243,7 @@
     // overlay: remova SEMPRE e solte listeners
     try{ window.removeEventListener('scroll', placeOverlay, {passive:true}); }catch{}
     try{ window.removeEventListener('resize', placeOverlay); }catch{}
-    if(state.overlayCanvas){ try{ state.overlayCanvas.remove(); }catch{} state.overlayCanvas=null; state.overlayAnchor=null; state.overlayAnchorPos=null; }
+    if(state.overlayCanvas){ try{ state.overlayCanvas.remove(); }catch{} state.overlayCanvas=null; state._overlayAnchor=null; state._overlayAnchorPos=null; }
 
     // hotkeys
     if(state.ui.keydownHandler){ window.removeEventListener('keydown', state.ui.keydownHandler, true); state.ui.keydownHandler=null; }
@@ -1342,7 +1324,7 @@
         #fxbot-ui{width:94vw; bottom:10px; right:10px}
         #fxbot-ui .grid3{grid-template-columns:1fr 1fr}
       }
-      /* make overlay crisp when pixelated */
+      /* ensure crisp preview */
       #fx-overlay { image-rendering: pixelated; image-rendering: crisp-edges; }
     `;
     document.head.appendChild(s);
