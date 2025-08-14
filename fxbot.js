@@ -2,7 +2,7 @@
   'use strict';
 
   // ===== Config (API-FREE) =====
-  const VERSION = 'v7.3';
+  const VERSION = 'v7.2';
   const UI_TICK_MS = 500;                 // UI refresh tick
   const REOPEN_DELAY_MS = 2000;           // normal reopen delay (non-depletion commits)
   const FULL_DEPLETION_REOPEN_MS = 35000; // wait ~+1 cooldown before reopening palette after "tinta acabou"
@@ -688,7 +688,7 @@
       const posX = gridX - Math.floor(imgW / 2);
       const posY = gridY - Math.floor(imgH / 2);
 
-      // STORE position in PIXELS so overlay placement and imageToCanvas use same units
+      // store anchor offset in CLIENT PIXELS relative to the canvas top-left (so image preview uses same tile)
       state.pos = { x: posX * tile, y: posY * tile };
 
       markOverlayDirty();
@@ -733,31 +733,31 @@
   }
 
   // ===== Overlay =====
-  // New behaviour:
-  // - state.pos is in PIXELS (so we compute overlay left/top = rect.left + state.pos.x)
-  // - overlay is anchored once and DOES NOT follow scroll/resize; it stays until user sets new pos or toggles overlay
-  // - preview is drawn at 1:1 pixel scale: canvas internal size == css size (cw x ch); image-rendering: pixelated
-
+  // Implementation notes:
+  // - overlay is appended to the SAME PARENT as the target canvas (if available)
+  // - overlay is positioned absolute inside that parent so it inherits parent's transforms/scale
+  // - overlay internal buffer (width/height) == image pixels * tile and CSS width/height set accordingly (1:1)
+  // - placement uses canvasRect and parentRect to compute left/top inside parent coordinates
   function ensureOverlay(){
-    if(state.overlayCanvas && document.body.contains(state.overlayCanvas)) return state.overlayCanvas;
+    if(state.overlayCanvas && (state.overlayCanvas.parentElement)) return state.overlayCanvas;
+    // create overlay
     const c=document.createElement('canvas'); c.id='fx-overlay';
-    Object.assign(c.style,{position:'fixed',pointerEvents:'none',opacity:'0.65',zIndex:999998, imageRendering:'pixelated'});
-    document.body.appendChild(c); state.overlayCanvas=c;
-    // Force repaint next refresh to avoid "blank" overlay after toggling
+    // we'll attach to the canvas parent later in placeOverlay()
+    Object.assign(c.style,{position:'absolute',pointerEvents:'none',opacity:'0.65',zIndex:999998, imageRendering:'pixelated', left:'0px', top:'0px'});
+    state.overlayCanvas=c;
     state.overlayNeedsRepaint = true;
-    // IMPORTANT: do NOT attach scroll/resize listeners; overlay should NOT move after placement
     return c;
   }
 
   function toggleOverlay() {
-    if (state.overlayCanvas) {
+    if (state.overlayCanvas && state.overlayCanvas.parentElement) {
       try {
         state.overlayCanvas.remove();
       } catch (e) {
         console.error(e);
       }
+      // keep the overlay canvas object for reuse but detach from DOM
       state.overlayCanvas = null;
-      // clear stored anchor
       state._overlayAnchor = null;
       setStatus(t('overlayOff'));
       return;
@@ -770,7 +770,6 @@
     }
 
     ensureOverlay();
-    // Make sure it paints immediately when re-enabled
     markOverlayDirty();
     repaintOverlay();
     placeOverlay();
@@ -786,7 +785,8 @@
     const iw=state.imgWidth, ih=state.imgHeight;
     const cw=iw*tile, ch=ih*tile;
 
-    // set internal buffer and CSS size equal -> 1:1 pixel mapping
+    // set internal buffer to logical pixels and CSS to same size (1:1). Since overlay is placed inside the canvas parent
+    // it will inherit parent's transforms and scale with canvas as needed (so alignment remains pixel-accurate).
     if(state.overlayCanvas.width !== cw) state.overlayCanvas.width = cw;
     if(state.overlayCanvas.height !== ch) state.overlayCanvas.height = ch;
     state.overlayCanvas.style.width = cw + 'px';
@@ -818,26 +818,37 @@
 
   function placeOverlay(){
     if(!state.overlayCanvas||!state.pos) return;
+    const target = getTargetCanvas();
+    const rect = canvasRect(); if(!rect || !target) return;
 
-    // If overlay already anchored to the same state.pos, keep it
-    if(state._overlayAnchor && state._overlayAnchorPos &&
-       state._overlayAnchorPos.x === state.pos.x && state._overlayAnchorPos.y === state.pos.y) {
-      // re-apply stored left/top to ensure still in DOM
+    // Ensure overlay is appended to same parent as the canvas so transforms/scale/pan applied to that parent
+    // also affect the overlay (keeps preview pixel aligned)
+    const parent = target.parentElement || document.body;
+    if(state.overlayCanvas.parentElement !== parent){
+      try{ parent.appendChild(state.overlayCanvas); }catch(e){ document.body.appendChild(state.overlayCanvas); }
+    }
+
+    // parentRect used to compute left/top in parent's coordinate space
+    const parentRect = parent.getBoundingClientRect();
+
+    // compute left/top INSIDE parent (client-space offset)
+    const leftInsideParent = (rect.left - parentRect.left) + state.pos.x;
+    const topInsideParent  = (rect.top  - parentRect.top)  + state.pos.y;
+
+    // if anchored to same pos previously, reuse anchor values
+    if(state._overlayAnchorPos && state._overlayAnchorPos.x === state.pos.x && state._overlayAnchorPos.y === state.pos.y && state._overlayAnchor){
+      // re-apply stored left/top (in case parent moved)
       state.overlayCanvas.style.left = state._overlayAnchor.left + 'px';
       state.overlayCanvas.style.top  = state._overlayAnchor.top  + 'px';
       return;
     }
 
-    const rect = canvasRect(); if(!rect) return;
-    // canvasRect() returns viewport coords; overlay is fixed (viewport-relative), so use rect.left/top directly.
-    const left = rect.left + state.pos.x;
-    const top  = rect.top  + state.pos.y;
-
-    state._overlayAnchor = { left, top };
+    state._overlayAnchor = { left: leftInsideParent, top: topInsideParent };
     state._overlayAnchorPos = { x: state.pos.x, y: state.pos.y };
 
-    state.overlayCanvas.style.left = left + 'px';
-    state.overlayCanvas.style.top  = top  + 'px';
+    // Place overlay at computed left/top inside parent
+    state.overlayCanvas.style.left = leftInsideParent + 'px';
+    state.overlayCanvas.style.top  = topInsideParent  + 'px';
   }
 
   // ===== Dedup =====
@@ -890,9 +901,10 @@
   function imageToCanvas(ix,iy){
     const rect=canvasRect(); if(!rect||!state.pos) return null;
     const s=Math.max(1,state.pixelSize|0);
+    // state.pos is stored in client pixels offset (as stored by selectPosition)
     const x=state.pos.x + ix*s + Math.floor(s/2);
     const y=state.pos.y + iy*s + Math.floor(s/2);
-    // bounds: use >= to avoid off-by-one; rect.width/height are viewport sizes
+    // bounds in client coords relative to canvas rect
     if(x<0||y<0||x>=rect.width||y>=rect.height) return null;
     return {x,y};
   }
@@ -900,6 +912,7 @@
   // ===== Clicks =====
   function clickCanvasSynthetic(canvas, cx, cy){
     const rect=canvasRect(); if(!rect) return;
+    // cx,cy are client-space offsets from canvas left/top
     const absX=Math.round(rect.left + cx);
     const absY=Math.round(rect.top  + cy);
     const common={clientX:absX, clientY:absY, bubbles:true, cancelable:true, pointerId:1, isPrimary:true, buttons:1};
