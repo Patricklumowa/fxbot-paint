@@ -34,7 +34,7 @@
       needImgPos:'Envie a imagem e marque a posição no canvas.',
       waitingClick:'Clique no CANTO SUPERIOR ESQUERDO da arte, dentro do canvas.',
       posOK:'Alinhado em X:{x} Y:{y}.',
-      posSelectCanceled: 'Seleção de posição cancelada.',
+      posSelectCanceled: 'Seleção de posição cancelada.',
       loadOK:'Imagem: {w}×{h} • {n} px',
       overlayOn:'Overlay ON.',
       overlayOff:'Overlay OFF.',
@@ -103,7 +103,7 @@
       needImgPos:'Upload an image and pick the canvas position.',
       waitingClick:'Click the TOP-LEFT corner of your art inside the canvas.',
       posOK:'Aligned at X:{x} Y:{y}.',
-      posSelectCanceled: 'Position selection canceled.',
+      posSelectCanceled: 'Position selection canceled.',
       loadOK:'Image: {w}×{h} • {n} px',
       overlayOn:'Overlay ON.',
       overlayOff:'Overlay OFF.',
@@ -170,7 +170,7 @@
   const state = {
     running:false, paused:false, stopFlag:false,
     imgData:null, imgWidth:0, imgHeight:0,
-    pos:null, // Relative pixel offset from canvas origin {x, y}
+    pos:null,
     pixelSize:1,
     skipWhite:true, skipTransparent:true,
     whiteThr:250, alphaThr:100,
@@ -310,7 +310,7 @@
       imgWidth: state.imgWidth, imgHeight: state.imgHeight,
       pos: state.pos,
       overlayAbsPos: state.overlayAbsPos, // OVERLAY CHANGE: Save absolute position
-      pixelSize: state.pixelSize,
+      pixelSize: state.pixelSize,
       skipWhite: state.skipWhite, skipTransparent: state.skipTransparent,
       whiteThr: state.whiteThr, alphaThr: state.alphaThr,
       order: state.order,
@@ -668,34 +668,33 @@
     const rect = canvasRect();
     if (!rect) {
         setStatus(t('noCanvas'));
-        showToast(t('noCanvas'), 'error');
         return;
     }
 
     setStatus(t('waitingClick'));
+
     const uiRoot = document.getElementById('fxbot-ui');
     let cancelKeyHandler = null;
 
     const onClick = (e) => {
-        // Ignore clicks on the bot's own UI
         if (uiRoot && uiRoot.contains(e.target)) {
-            arm(); // Re-arm the listener for the next click outside the UI
+            arm();
             return;
         }
 
-        const rect = canvasRect(); // Get fresh rect on click
-        if (!rect) return;
+        const currentRect = canvasRect(); // Get fresh rect on click
+        if (!currentRect) return;
 
-        // Calculate click position relative to the target canvas's top-left corner
-        const relX = e.clientX - rect.left;
-        const relY = e.clientY - rect.top;
+        // Use original logic to maintain expected behavior, but ensure it's relative to the canvas
+        const relX = e.clientX - currentRect.left;
+        const relY = e.clientY - currentRect.top;
 
-        // Store this relative pixel offset. This is the top-left of the art.
+        // This sets the top-left corner of the image based on the click
         state.pos = { x: Math.floor(relX), y: Math.floor(relY) };
 
-        // OVERLAY CHANGE: Calculate and store the overlay's absolute page coordinates
-        const canvasAbsX = rect.left + window.scrollX;
-        const canvasAbsY = rect.top + window.scrollY;
+        // Calculate and store the overlay's absolute page coordinates
+        const canvasAbsX = currentRect.left + window.scrollX;
+        const canvasAbsY = currentRect.top + window.scrollY;
         state.overlayAbsPos = {
             left: canvasAbsX + state.pos.x,
             top:  canvasAbsY + state.pos.y
@@ -708,7 +707,6 @@
         saveSession('auto');
         setStatus(t('posOK', { x: state.pos.x, y: state.pos.y }));
 
-        // Clean up the escape key listener
         if (cancelKeyHandler) {
             document.removeEventListener('keydown', cancelKeyHandler, true);
             cancelKeyHandler = null;
@@ -716,22 +714,17 @@
     };
 
     function arm() {
-        // Add a one-time click listener to the whole document
         document.addEventListener('click', onClick, { once: true, capture: true });
-
-        // Add a listener for the Escape key to cancel the operation
         cancelKeyHandler = (ev) => {
             if (ev.key === 'Escape') {
-                document.removeEventListener('click', onClick, true); // Clean up click listener
-                document.removeEventListener('keydown', cancelKeyHandler, true); // Clean up self
+                document.removeEventListener('click', onClick, true);
+                document.removeEventListener('keydown', cancelKeyHandler, true);
                 cancelKeyHandler = null;
                 setStatus(t('posSelectCanceled'));
             }
         };
         document.addEventListener('keydown', cancelKeyHandler, true);
     }
-
-    // Arm the position selector
     setTimeout(arm, 0);
 }
 
@@ -1234,7 +1227,7 @@
     state.applied.pendingSet.clear && state.applied.pendingSet.clear();
 
     // overlay: remova SEMPRE e solte listeners
-    // OVERLAY CHANGE: No more listeners to remove here
+    // OVERLAY CHANGE: No more listeners to remove here
     if(state.overlayCanvas){ try{ state.overlayCanvas.remove(); }catch{} state.overlayCanvas=null; }
 
     // hotkeys
