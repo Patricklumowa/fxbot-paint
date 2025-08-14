@@ -730,57 +730,78 @@
   }
 
   // ===== Overlay =====
+  // Replaced overlay system to:
+  // - anchor overlay exactly where user sets state.pos (in *pixels*)
+  // - do NOT follow canvas on scroll/resize
+  // - render preview at 1:1 pixel scale (internal buffer == CSS size), imageRendering:'pixelated'
+
+  // ensureOverlay: creates overlay canvas (fixed) but DOES NOT attach scroll/resize listeners.
+  // Overlay will be positioned once when user sets position and will not move unless user sets a new position.
   function ensureOverlay(){
     if(state.overlayCanvas && document.body.contains(state.overlayCanvas)) return state.overlayCanvas;
     const c=document.createElement('canvas'); c.id='fx-overlay';
-    Object.assign(c.style,{position:'fixed',pointerEvents:'none',opacity:'0.65',zIndex:999998});
+    // fixed so it sits above viewport; we will compute left/top in placeOverlay
+    Object.assign(c.style,{position:'fixed',pointerEvents:'none',opacity:'0.65',zIndex:999998, imageRendering:'pixelated'});
     document.body.appendChild(c); state.overlayCanvas=c;
     // Force repaint next refresh to avoid "blank" overlay after toggling
     state.overlayNeedsRepaint = true;
-    window.addEventListener('scroll', placeOverlay, {passive:true});
-    window.addEventListener('resize', placeOverlay);
+    // We intentionally DO NOT follow canvas scroll/resize automatically — overlay should stay where user placed it.
+    // If user sets a new state.pos, placeOverlay() will recompute the anchor and move the overlay.
     return c;
   }
+
+  // toggleOverlay remains mostly the same; it will remove the overlay and clear the stored anchor when turned off.
   function toggleOverlay() {
-  if (state.overlayCanvas) {
-    try {
-      state.overlayCanvas.remove();
-    } catch (e) {
-      console.error(e);
+    if (state.overlayCanvas) {
+      try {
+        state.overlayCanvas.remove();
+      } catch (e) {
+        console.error(e);
+      }
+      state.overlayCanvas = null;
+      // clear anchor so next enable repositions fresh
+      state.overlayAnchor = null;
+      state.overlayAnchorPos = null;
+      setStatus(t('overlayOff'));
+      return;
     }
-    state.overlayCanvas = null;
-    setStatus(t('overlayOff'));
-    return;
+
+    if (!state.imgData || !state.pos) {
+      setStatus(t('needImgPos'));
+      showToast(t('mustPickPos'), 'warn');
+      return;
+    }
+
+    ensureOverlay();
+    // Make sure it paints immediately when re-enabled
+    markOverlayDirty();
+    repaintOverlay();
+    placeOverlay();
+    setStatus(t('overlayOn'));
   }
 
-  if (!state.imgData || !state.pos) {
-    setStatus(t('needImgPos'));
-    showToast(t('mustPickPos'), 'warn');
-    return;
-  }
-
-  ensureOverlay();
-  // Make sure it paints immediately when re-enabled
-  markOverlayDirty();
-  repaintOverlay();
-  placeOverlay();
-  setStatus(t('overlayOn'));
-}
-
-  function markOverlayDirty(){ state.overlayNeedsRepaint=true; }
-  function refreshOverlay(){ if(!state.overlayCanvas) return; repaintOverlay(); placeOverlay(); }
+  // repaintOverlay: draw the preview at 1:1 pixel scale according to state.pixelSize.
+  // This sets both the canvas internal resolution and its CSS size so the preview does not get
+  // auto-scaled by page zoom/transform (it will remain fixed at the computed pixels).
   function repaintOverlay(){
     if(!state.overlayCanvas||!state.imgData) return;
-    const tile=Math.max(1,state.pixelSize|0);
+    const tile = Math.max(1, state.pixelSize|0); // tile size in CSS pixels
     const iw=state.imgWidth, ih=state.imgHeight;
     const cw=iw*tile, ch=ih*tile;
-    if(state.overlayCanvas.width!==cw) state.overlayCanvas.width=cw;
-    if(state.overlayCanvas.height!==ch) state.overlayCanvas.height=ch;
+
+    // Set internal pixel buffer and CSS size to the exact same values -> 1:1 mapping
+    if(state.overlayCanvas.width !== cw) state.overlayCanvas.width = cw;
+    if(state.overlayCanvas.height !== ch) state.overlayCanvas.height = ch;
+    state.overlayCanvas.style.width = cw + 'px';
+    state.overlayCanvas.style.height = ch + 'px';
+
     if(!state.overlayNeedsRepaint) return;
     state.overlayNeedsRepaint=false;
     const ctx=state.overlayCanvas.getContext('2d');
-    const pal=state.palette.length?state.palette:extractPalette(); const usePal=pal.length>0; const cache=new Map();
+    // disable smoothing to keep crisp pixel-art look
+    ctx.imageSmoothingEnabled = false;
     ctx.clearRect(0,0,cw,ch);
+    const pal=state.palette.length?state.palette:extractPalette(); const usePal=pal.length>0; const cache=new Map();
     for(let y=0;y<ih;y++){
       for(let x=0;x<iw;x++){
         const i=(y*iw+x)*4;
@@ -793,15 +814,36 @@
           if(!best){ let md=1e9, sel=pal[0]; for(const p of pal){ const d=U.colorDist(rgb,p.rgb); if(d<md){md=d; sel=p;} } best=sel; cache.set(key,best); }
           rgb=best.rgb;
         }
-        ctx.fillStyle=`rgb(${rgb[0]},${rgb[1]},${rgb[2]})`; ctx.fillRect(x*tile, y*tile, tile, tile);
+        ctx.fillStyle=`rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+        ctx.fillRect(x*tile, y*tile, tile, tile);
       }
     }
   }
+
+  // placeOverlay: compute a fixed viewport anchor only when state.pos changes.
+  // After anchor is set, the overlay will stay there until the user moves the image (sets a new pos).
   function placeOverlay(){
     if(!state.overlayCanvas||!state.pos) return;
-    const rect=canvasRect(); if(!rect) return;
-    state.overlayCanvas.style.left=(rect.left+window.scrollX+state.pos.x)+'px';
-    state.overlayCanvas.style.top =(rect.top +window.scrollY+state.pos.y)+'px';
+
+    // If we already anchored to this exact state.pos, keep it — do not recompute.
+    if(state.overlayAnchor && state.overlayAnchorPos && state.overlayAnchorPos.x === state.pos.x && state.overlayAnchorPos.y === state.pos.y){
+      // just ensure CSS left/top remain applied
+      state.overlayCanvas.style.left = state.overlayAnchor.left + 'px';
+      state.overlayCanvas.style.top  = state.overlayAnchor.top  + 'px';
+      return;
+    }
+
+    // Compute a new anchor based on the *current* canvas viewport coordinates and the user-set state.pos.
+    const rect = canvasRect(); if(!rect) return;
+    // canvasRect() is viewport-relative; overlay is fixed -> use rect.left/top directly (no scroll offsets)
+    const left = rect.left + state.pos.x;
+    const top  = rect.top  + state.pos.y;
+
+    state.overlayAnchor = { left, top };
+    state.overlayAnchorPos = { x: state.pos.x, y: state.pos.y };
+
+    state.overlayCanvas.style.left = left + 'px';
+    state.overlayCanvas.style.top  = top  + 'px';
   }
 
   // ===== Dedup =====
